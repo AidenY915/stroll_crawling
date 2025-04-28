@@ -20,12 +20,17 @@ DATABASE_PASSWORD = None
 def init():
     global KAKAO_API_KEY
     global driver
+    global DATABASE_NAME
+    global DATABASE_HOST
+    global DATABASE_USER
+    global DATABASE_PASSWORD
 
      # 이미지 저장을 위한 디렉토리 생성
     if not os.path.exists('./images'):
         os.makedirs('./images')
 
-    load_dotenv()
+    load_dotenv(override=True)
+    
     KAKAO_API_KEY = os.getenv("KAKAO_API_KEY")
     DATABASE_NAME = os.getenv("DATABASE_NAME")
     DATABASE_HOST = os.getenv("DATABASE_HOST")
@@ -98,7 +103,7 @@ def extract_gu_address(addr):
     return rslt
 
 
-def insert_to_database(title, category, gu_address, after_gu_address, detail_address, x, y, user_id, image_path):
+def insert_place_to_database(title, category, gu_address, after_gu_address, detail_address, x, y, user_id):
     # DB 연결
     connection = pymysql.connect(
         host=DATABASE_HOST,         # 또는 RDS 주소
@@ -108,7 +113,7 @@ def insert_to_database(title, category, gu_address, after_gu_address, detail_add
         charset='utf8mb4',         # 한글 인코딩 문제 방지
         cursorclass=pymysql.cursors.DictCursor
     )
-
+    place_no = None
     try:
         with connection.cursor() as cursor:
             # 삽입할 SQL
@@ -132,27 +137,52 @@ def insert_to_database(title, category, gu_address, after_gu_address, detail_add
 
             # 쿼리 실행
             cursor.execute(sql, values)
-            
             # 저장한 장소의 번호 가져오기
-            if image_path is not None:
-                place_no = cursor.lastrowid
-                sql = """
-                INSERT INTO image
-                (place_no, image_path) 
-                VALUES (%s, %s)
-                """
-                values = (place_no, image_path)
-                cursor.execute(sql, values)
-
+            place_no = cursor.lastrowid
+            
         # 변경사항 커밋
         connection.commit()
+        return place_no
 
     except Exception as e:
         print("DB 삽입 중 오류 발생:", e)
+        connection.rollback()  # 오류 발생 시 롤백
+        return None
 
     finally:
         connection.close()
 
+        
+def insert_image_to_database(place_no, img_title):
+    connection = pymysql.connect(
+        host=DATABASE_HOST,         # 또는 RDS 주소
+        user=DATABASE_USER,     # DB 사용자 이름
+        password=DATABASE_PASSWORD, # DB 비밀번호
+        database=DATABASE_NAME, # DB 이름
+        charset='utf8mb4',         # 한글 인코딩 문제 방지
+        cursorclass=pymysql.cursors.DictCursor
+    )
+    
+    try:
+        with connection.cursor() as cursor:
+            image_path = "images/"+img_title
+            sql = """
+            INSERT INTO image
+            (place_no, image_path) 
+            VALUES (%s, %s)
+            """
+            values = (place_no, image_path)
+            cursor.execute(sql, values)
+        # 변경사항 커밋
+        connection.commit()
+
+    except Exception as e:
+        print("이미지 정보 DB 저장 중 오류 발생:", e)
+        connection.rollback()  # 오류 발생 시 롤백
+
+    finally:
+        connection.close()
+                
 
 def main():
     init()
@@ -196,7 +226,9 @@ def main():
             after_gu_address = road_address.replace(gu_address, "")
 
             print(title.text, category.text, gu_address, after_gu_address, detail_address, x, y)
-            image_path = None  
+            place_no = insert_place_to_database(title.text, category.text, gu_address, after_gu_address, detail_address, x, y, "admin")
+            does_image_exists = False  
+            img_title=str(place_no)+"_1.jpg"
             #이미지 다운로드
             try:
                 img = li_element.find_element(By.CSS_SELECTOR, 'img')
@@ -204,10 +236,9 @@ def main():
                 if img_src:
                     try:
                         img_data = requests.get(img_src).content
-                        with open(f"C:/stroll_image/{title.text}.jpg", "wb") as f:
+                        with open(f"C:/stroll_image/"+img_title, "wb") as f:
                             f.write(img_data)
-                        print(f"{title.text}.jpg")
-                        image_path = "images/"+title.text+".jpg"            
+                        does_image_exists = True
                     except Exception as e:
                         print(f"Error downloading {img_src}: {e}")
                     print(img_src)
@@ -216,7 +247,10 @@ def main():
             #이미지 S3에 업로드 후 데이터 베이스 image 테이블에 추가해야함.
 
             #데이터베이스에 장소 및 이미지 인스턴스 추가
-            insert_to_database(title.text, category.text, gu_address, after_gu_address, detail_address, x, y, "admin", image_path)
+            
+            if does_image_exists:
+                print(place_no)
+                insert_image_to_database(place_no, img_title)
                 
     # 종료
     driver.quit()
