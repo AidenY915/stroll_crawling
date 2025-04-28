@@ -7,10 +7,15 @@ import requests
 from dotenv import load_dotenv
 import os
 import re
+import pymysql
 
 KAKAO_API_KEY=None
 CHROMEDRIVER_PATH = "../chromedriver-win64/chromedriver.exe"
 driver = None
+DATABASE_NAME = None
+DATABASE_HOST = None
+DATABASE_USER = None
+DATABASE_PASSWORD = None
 
 def init():
     global KAKAO_API_KEY
@@ -21,7 +26,11 @@ def init():
         os.makedirs('./images')
 
     load_dotenv()
-    KAKAO_API_KEY=os.getenv("KAKAO_API_KEY")
+    KAKAO_API_KEY = os.getenv("KAKAO_API_KEY")
+    DATABASE_NAME = os.getenv("DATABASE_NAME")
+    DATABASE_HOST = os.getenv("DATABASE_HOST")
+    DATABASE_USER = os.getenv("DATABASE_USER")
+    DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
 
     # 옵션 설정
     options = Options()
@@ -39,23 +48,27 @@ def convert_to_road_address(addr):
         "Authorization": f"KakaoAK {KAKAO_API_KEY}"  # 여기에 본인의 REST API 키 삽입
     }
 
-    res = requests.get(url, headers=headers)
-    data = res.json()
-    
-    # documents 리스트에서 첫 번째 결과 추출
-    documents = data.get("documents", [])
-    if not documents:
-        return None  # 검색 결과 없음
+    try:
+        res = requests.get(url, headers=headers)
+        data = res.json()
+        
+        # documents 리스트에서 첫 번째 결과 추출
+        documents = data.get("documents", [])
+        if not documents:
+            return None, None, None  # 검색 결과 없음
 
-    first = documents[0]
+        first = documents[0]
 
-    # 도로명 주소 우선, 없으면 지번 주소
-    if first.get("road_address"):
-        return first["road_address"].get("address_name")
-    elif first.get("address"):
-        return first["address"].get("address_name")
-    else:
-        return None
+        # 도로명 주소 우선, 없으면 지번 주소
+        if first.get("road_address"):
+            return first["road_address"].get("address_name"), first["x"], first["y"]
+        elif first.get("address"):
+            return first["address"].get("address_name"), first["x"], first["y"]
+        else:
+            return None, None, None
+    except Exception as e:
+        print(f"주소 변환 중 오류 발생: {e}")
+        return None, None, None
 
 
 def strip_detail_address(addr):
@@ -73,13 +86,77 @@ def extract_detail_address(addr):
 
 
 def extract_gu_address(addr):
-    # 시/도 + 구/군 까지만 추출
-    match = re.search(r'^([\w가-힣]+[시도]\s[\w가-힣]+[구군])', addr)
-    return match.group(1) if match else addr
+    # 시/도 + 구/군 까지만 추출 구가 없으면 시나 군까지가 구
+    rslt = None
+    match = re.search(r'^(([가-힣]+\s)?([가-힣]+[시]\s[가-힣]+[구군]\s))', addr)
+    if match:
+        rslt = match.group(1).strip()
+    else:
+        match = re.search(r'^(([가-힣]+\s)?([\w가-힣]+[시군]\s))', addr)
+        if match:
+            rslt = match.group(1).strip()
+    return rslt
+
+
+def insert_to_database(title, category, gu_address, after_gu_address, detail_address, x, y, user_id, image_path):
+    # DB 연결
+    connection = pymysql.connect(
+        host=DATABASE_HOST,         # 또는 RDS 주소
+        user=DATABASE_USER,     # DB 사용자 이름
+        password=DATABASE_PASSWORD, # DB 비밀번호
+        database=DATABASE_NAME, # DB 이름
+        charset='utf8mb4',         # 한글 인코딩 문제 방지
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+    try:
+        with connection.cursor() as cursor:
+            # 삽입할 SQL
+            sql = """
+            INSERT INTO place
+            (title, category, gu_address, after_gu_address, detail_address, x, y, user_id) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+
+            # 삽입할 값
+            values = (
+                title,
+                category, 
+                gu_address, 
+                after_gu_address, 
+                detail_address, 
+                x, 
+                y, 
+                user_id
+            )
+
+            # 쿼리 실행
+            cursor.execute(sql, values)
+            
+            # 저장한 장소의 번호 가져오기
+            if image_path is not None:
+                place_no = cursor.lastrowid
+                sql = """
+                INSERT INTO image
+                (place_no, image_path) 
+                VALUES (%s, %s)
+                """
+                values = (place_no, image_path)
+                cursor.execute(sql, values)
+
+        # 변경사항 커밋
+        connection.commit()
+
+    except Exception as e:
+        print("DB 삽입 중 오류 발생:", e)
+
+    finally:
+        connection.close()
+
 
 def main():
     init()
-    # 접속할 사이트
+    # 접속할 사이트 현재 좌표를 여기에 넣고 있음.
     url = "https://pcmap.place.naver.com/place/list?query=%EA%B0%95%EC%95%84%EC%A7%80&x=127.005941&y=37.268905&clientX=127.005941&clientY=37.268905&display=70&ts=1744774586148&additionalHeight=76&locale=ko&mapUrl=https%3A%2F%2Fmap.naver.com%2Fp%2Fsearch%2F%EA%B0%95%EC%95%84%EC%A7%80%2Fplace%2F12945929"  # 예: 해커뉴스
     driver.get(url)
 
@@ -105,32 +182,41 @@ def main():
             address = li_element.find_element(By.CSS_SELECTOR, 'div > div > div > div > div > div > div > span:nth-of-type(2)')
             detail_address = extract_detail_address(address.text)
             rest_address = strip_detail_address(address.text)
-            
-            road_address = convert_to_road_address(rest_address)
-            gu_address = extract_gu_address(road_address)
-            after_gu_address = road_address.replace(gu_address, "")
-            
-            if(road_address is None):
-                continue
-            print(title.text, category.text, gu_address, after_gu_address, detail_address)
+            #도로명 주소를 받아오면서, 좌표값도 받아옴.            
+            road_address, x, y = convert_to_road_address(rest_address)
 
+            if road_address is None:
+                print(f"주소 변환 실패: {rest_address}")
+                continue
+
+            gu_address = extract_gu_address(road_address)
+            if(gu_address is None):
+                print("gu_address 추출 실패:", road_address)
+                continue
+            after_gu_address = road_address.replace(gu_address, "")
+
+            print(title.text, category.text, gu_address, after_gu_address, detail_address, x, y)
+            image_path = None  
             #이미지 다운로드
             try:
                 img = li_element.find_element(By.CSS_SELECTOR, 'img')
                 img_src = img.get_attribute("src").replace("type=f160_160", "type=w560_sharpen")
-                
-                # 데이터 베이스 연결해서 no랑 연동해서 업로드 해야함.
                 if img_src:
                     try:
                         img_data = requests.get(img_src).content
-                        with open(f"./images/{title.text}.jpg", "wb") as f:
+                        with open(f"C:/stroll_image/{title.text}.jpg", "wb") as f:
                             f.write(img_data)
                         print(f"{title.text}.jpg")
+                        image_path = "images/"+title.text+".jpg"            
                     except Exception as e:
                         print(f"Error downloading {img_src}: {e}")
                     print(img_src)
             except Exception as e:
                 print(f"{title.text}은(는) 이미지 없음.")
+            #이미지 S3에 업로드 후 데이터 베이스 image 테이블에 추가해야함.
+
+            #데이터베이스에 장소 및 이미지 인스턴스 추가
+            insert_to_database(title.text, category.text, gu_address, after_gu_address, detail_address, x, y, "admin", image_path)
                 
     # 종료
     driver.quit()
