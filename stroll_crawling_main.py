@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import os
 import re
 import pymysql
+import boto3
 
 KAKAO_API_KEY=None
 CHROMEDRIVER_PATH = "../chromedriver-win64/chromedriver.exe"
@@ -16,6 +17,11 @@ DATABASE_NAME = None
 DATABASE_HOST = None
 DATABASE_USER = None
 DATABASE_PASSWORD = None
+AWS_ACCESS_KEY_ID = None
+AWS_SECRET_ACCESS_KEY = None
+REGION_NAME = None
+BUCKET_NAME = None
+ADMIN_ID = None
 
 def init():
     global KAKAO_API_KEY
@@ -24,6 +30,11 @@ def init():
     global DATABASE_HOST
     global DATABASE_USER
     global DATABASE_PASSWORD
+    global AWS_ACCESS_KEY_ID
+    global AWS_SECRET_ACCESS_KEY
+    global REGION_NAME
+    global BUCKET_NAME
+    global ADMIN_ID
 
      # 이미지 저장을 위한 디렉토리 생성
     if not os.path.exists('./images'):
@@ -36,6 +47,11 @@ def init():
     DATABASE_HOST = os.getenv("DATABASE_HOST")
     DATABASE_USER = os.getenv("DATABASE_USER")
     DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+    REGION_NAME = os.getenv("REGION_NAME")
+    BUCKET_NAME = os.getenv("BUCKET_NAME")
+    ADMIN_ID = os.getenv("ADMIN_ID")
 
     # 옵션 설정
     options = Options()
@@ -50,17 +66,23 @@ def init():
 def convert_to_road_address(addr):
     url = f"https://dapi.kakao.com/v2/local/search/address.json?query={addr}"
     headers = {
-        "Authorization": f"KakaoAK {KAKAO_API_KEY}"  # 여기에 본인의 REST API 키 삽입
+        "Authorization": f"KakaoAK {KAKAO_API_KEY}" 
     }
 
     try:
         res = requests.get(url, headers=headers)
         data = res.json()
         
+        # API 응답 상태 확인
+        if res.status_code != 200:
+            print(f"API 호출 실패: {res.status_code} - {data.get('message', '알 수 없는 오류')}")
+            return None, None, None
+            
         # documents 리스트에서 첫 번째 결과 추출
         documents = data.get("documents", [])
         if not documents:
-            return None, None, None  # 검색 결과 없음
+            print(f"검색 결과 없음: {addr}")
+            return None, None, None
 
         first = documents[0]
 
@@ -70,6 +92,7 @@ def convert_to_road_address(addr):
         elif first.get("address"):
             return first["address"].get("address_name"), first["x"], first["y"]
         else:
+            print(f"주소 정보 없음: {addr}")
             return None, None, None
     except Exception as e:
         print(f"주소 변환 중 오류 발생: {e}")
@@ -153,7 +176,7 @@ def insert_place_to_database(title, category, gu_address, after_gu_address, deta
         connection.close()
 
         
-def insert_image_to_database(place_no, img_title):
+def insert_image_to_database(place_no, image_path):
     connection = pymysql.connect(
         host=DATABASE_HOST,         # 또는 RDS 주소
         user=DATABASE_USER,     # DB 사용자 이름
@@ -165,7 +188,6 @@ def insert_image_to_database(place_no, img_title):
     
     try:
         with connection.cursor() as cursor:
-            image_path = "images/"+img_title
             sql = """
             INSERT INTO image
             (place_no, image_path) 
@@ -182,6 +204,27 @@ def insert_image_to_database(place_no, img_title):
 
     finally:
         connection.close()
+
+def push_image_to_S3(img_data, image_path):
+    # 세션 생성
+    session = boto3.Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=REGION_NAME
+    )
+
+    s3 = session.client('s3')
+
+    # S3 업로드
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=image_path,
+        Body=img_data,  # 여기에 파일 데이터 바로 넘김
+        ContentType='image/jpeg'  # 필요하면 ContentType 지정
+    )
+
+    return 
+    
                 
 
 def main():
@@ -226,9 +269,10 @@ def main():
             after_gu_address = road_address.replace(gu_address, "")
 
             print(title.text, category.text, gu_address, after_gu_address, detail_address, x, y)
-            place_no = insert_place_to_database(title.text, category.text, gu_address, after_gu_address, detail_address, x, y, "admin")
+            place_no = insert_place_to_database(title.text, category.text, gu_address, after_gu_address, detail_address, x, y, ADMIN_ID)
             does_image_exists = False  
             img_title=str(place_no)+"_1.jpg"
+            image_path="image/"+img_title
             #이미지 다운로드
             try:
                 img = li_element.find_element(By.CSS_SELECTOR, 'img')
@@ -236,8 +280,7 @@ def main():
                 if img_src:
                     try:
                         img_data = requests.get(img_src).content
-                        with open(f"C:/stroll_image/"+img_title, "wb") as f:
-                            f.write(img_data)
+                        push_image_to_S3(img_data, image_path)
                         does_image_exists = True
                     except Exception as e:
                         print(f"Error downloading {img_src}: {e}")
@@ -250,7 +293,7 @@ def main():
             
             if does_image_exists:
                 print(place_no)
-                insert_image_to_database(place_no, img_title)
+                insert_image_to_database(place_no, image_path)
                 
     # 종료
     driver.quit()
